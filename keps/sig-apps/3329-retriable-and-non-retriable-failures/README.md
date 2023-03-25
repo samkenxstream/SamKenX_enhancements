@@ -109,6 +109,9 @@ tags, and then generate with `hack/update-toc.sh`.
     - [JobSpec API alternatives](#jobspec-api-alternatives)
     - [Failing delete after a condition is added](#failing-delete-after-a-condition-is-added)
     - [Marking pods as Failed](#marking-pods-as-failed)
+      - [Review of example steps for the 3rd scenario](#review-of-example-steps-for-the-3rd-scenario)
+      - [Proposed solution for the 3rd scenario](#proposed-solution-for-the-3rd-scenario)
+      - [Implementation progress and plan](#implementation-progress-and-plan)
   - [Risks and Mitigations](#risks-and-mitigations)
     - [Garbage collected pods](#garbage-collected-pods)
     - [Evolving condition types](#evolving-condition-types)
@@ -230,7 +233,7 @@ thousands of nodes requires usage of pod restart policies in order
 to account for infrastructure failures.
 
 Currently, kubernetes Job API offers a way to account for infrastructure
-failures by setting `.backoffLimit > 0`. However, this mechanism intructs the
+failures by setting `.backoffLimit > 0`. However, this mechanism instructs the
 job controller to restart all failed pods - regardless of the root cause
 of the failures. Thus, in some scenarios this leads to unnecessary
 restarts of many pods, resulting in a waste of time and computational
@@ -354,7 +357,7 @@ As a machine learning researcher, I run jobs comprising thousands
 of long-running pods on a cluster comprising thousands of nodes. The jobs often
 run at night or over weekend without any human monitoring. In order to account
 for random infrastructure failures we define `.backoffLimit: 6` for the job.
-However, a signifficant portion of the failures happen due to bugs in code.
+However, a significant portion of the failures happen due to bugs in code.
 Moreover, the failures may happen late during the program execution time. In
 such case, restarting such a pod results in wasting a lot of computational time.
 
@@ -729,7 +732,7 @@ in different messages for pods.
 - Reproduction: Run kube-controller-manager with disabled taint-manager (with the
   flag `--enable-taint-manager=false`). Then, run a job with a long-running pod and
   disconnect the node
-- Comments: handled by node lifcycle controller in: `controller/nodelifecycle/node_lifecycle_controller.go`.
+- Comments: handled by node lifecycle controller in: `controller/nodelifecycle/node_lifecycle_controller.go`.
   However, the pod phase remains `Running`.
 - Pod status:
   - status: Unknown
@@ -762,7 +765,7 @@ In Alpha, there is no support for Pod conditions for failures or disruptions ini
 
 For Beta we introduce handling of Pod failures initiated by Kubelet by adding
 the pod disruption condition (introduced in Alpha) in case of disruptions
-initiated by kubetlet (see [Design details](#design-details)).
+initiated by Kubelet (see [Design details](#design-details)).
 
 Kubelet can also evict a pod in some scenarios which are not covered with
 adding a pod failure condition:
@@ -818,9 +821,12 @@ for event handling and
 for the constant definition)
 and CRI-O (see
 [here](https://github.com/cri-o/cri-o/blob/edf889bd277ae9a8aa699c354f12baaef3d9b71d/server/container_status.go#L88-L89)).
-- setting the `reason` field to `OOMKilled` is not standardized, either. We have
-started an effort to standardize the handling of OOM killed containers
-(see: [Documentation for the CRI API reason field to standardize the field for containers terminated by OOM killer](https://github.com/kubernetes/kubernetes/pull/112977)).
+- setting the `reason` field to `OOMKilled` is not standardized, either. During
+the Beta phase implementation we discussed the standardization issue within the
+community (involving CNCF Technical Advisory Group for Runtime and SIG-node).
+We have also started an effort to standardize the handling of OOM killed
+containers (see:
+[Documentation for the CRI API reason field to standardize the field for containers terminated by OOM killer](https://github.com/kubernetes/kubernetes/pull/112977)).
 However, in the process it turned out that in some configurations
 (for example the CRI-O with cgroupv2, see:
 [Add e2e_node test for oom killed container reason](https://github.com/kubernetes/kubernetes/pull/113205)),
@@ -830,8 +836,11 @@ but also when the system is running low on memory. In such scenario there
 can be race conditions in which both the `DisruptionTarget` condition and the
 `ResourceExhausted` could be added.
 
-Thus, we decide not to annotate the scenarios with the `ResourceExhausted`
-condition. While there are not known issues with detection of the exceeding of
+Thus, we've decided not to annotate the scenarios with the `ResourceExhausted`
+condition in this KEP. Handling of exceeded limits might be done as a
+follow up KEP once the ground work of introducing pod failure conditions is done.
+
+While there are not known issues with detection of the exceeding of
 Pod's ephemeral storage limits, we prefer to avoid future extension of the
 semantics of the new condition type. Alternatively, we could introduce a pair of
 dedicated pod condition types: `OOMKilled` and `EphemeralStorageLimitExceeded`.
@@ -863,7 +872,7 @@ dies) between appending a pod condition and deleting the pod.
 In particular, scheduler can possibly decide to preempt
 a different pod the next time (or none). This would leave a pod with a
 condition that it was preempted, when it actually wasn't. This in turn
-could lead to inproper handling of the pod by the job controller.
+could lead to improper handling of the pod by the job controller.
 
 As a solution we implement a worker, part of the disruption
 controller, which clears the pod condition added if `DeletionTimestamp` is
@@ -871,32 +880,318 @@ not added to the pod for a long enough time (for example 2 minutes).
 
 #### Marking pods as Failed
 
-As indicated by our experiments (see: [Disconnected node](#disconnected-node))
-a failed pod may get stuck in the `Running` phase when there is no kubelet
-working properly. In particular, this happens
-in case of orphaned pods which are deleted by garbage-collector. Due to this
-issue the logic of detecting pod failures in job controller is more complex than
-would be needed otherwise.
+When matching a failed pod against Job pod failure policy it is important that
+the pod is actually in the terminal phase (`Failed`), to ensure their state is
+not modified while Job controller matches them against the pod failure policy.
 
-Notably, this issue affects also an analogous scenario in which the taint-manager
-is disabled [Disconnected node when taint-manager is disabled](#disconnected-node-when-taint-manager-is-disabled).
-However, as disabling taint-manager is deprecated it is not a concern for this
-KEP.
+However, there are scenarios in which a pod gets stuck in a non-terminal phase,
+but is doomed to be failed, as it is terminating (has `deletionTimestamp` set, also
+known as the `DELETING` state, see:
+[The API Object Lifecycle](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/object-lifecycle.md)).
+In order to workaround this issue, Job controller, when pod failure policy is
+disabled, considers any terminating pod that is in a non-terminal phase as failed.
+Note that, it is important that when Job controller considers such pods as failed
+so that it removes their finalizers and thus allows the API server to complete
+their deletion.
 
-For Alpha, we implemented a fix for this issue by setting the pod phase as `Failed`
-in podgc.
+In order to ensure consistency in behavior when handling pod failures when
+pod failure policy is used or not, we need to make sure that all pods which
+are terminating (were previously considered as failed by the Job controller),
+are transitioned to the failed state eventually.
 
-For Beta, we are going to simplify the code in job controller responsible for
-detecting pod failures. For this purpose we need to make sure that pods stuck
-in the pending phase which are terminating (with set deletionTimestamp) are
-eventually marked as failed. Such pods may either be not scheduled
-(for example when they are unschedulable due to node affinity configuration for
-which no node exists in the cluster) or scheduled (for example when they fail
-to pull the the docker image). In case of non-scheduled pods they will be moved
-to the `Failed` phase by the PodGC controller as it marks as failed all
-non-scheduled terminating pods (after the Alpha changes for this feature, see
-above). We plan to extend the PodGC controller to also move to the failed phase
-(and delete) scheduled pods in the pending state which are terminating.
+Thus, we review scenarios in which a pod is considered by Job controller as
+failed, but may get stuck in a non-terminal. Note that, the following scenarios
+are not only problematic to the Job controller (due to its use of finalizers),
+but they can be considered as bugs in their own right, as every pod should end
+up in a terminal phase, even if not started
+(see [discussion](https://github.com/kubernetes/enhancements/pull/3757#discussion_r1095197982)).
+
+1. **Orphan pods** (solved in Alpha)
+
+This pod state is characterized by the following:
+- scheduled (the Pod's `.spec.nodeName` is set), but the node no longer exists
+- `Running` or `Pending` phase
+
+Note that, as PodGC sends DELETE request for such pod (DELETE request was sent
+prior to this KEP, but without setting the phase to `Failed`), it becomes also
+terminating (has `deletionTimestamp` set).
+
+Example steps leading to the Pod's state:
+- pod scheduled to a node, might be `Running` or `Pending`
+- node deleted (see: [Disconnected node](#disconnected-node))
+
+2. **Pending, terminating and unscheduled** (solved in Alpha)
+
+This pod state is characterized by the following:
+- unscheduled (the Pod's `.spec.nodeName` is nil), so no Kubelet is assigned
+- `Pending` phase
+- the Pod's `deletionTimestamp` is set by a DELETE request (terminating)
+
+Example steps leading to the Pod's state:
+- unschedulable pod (for example due to unsatisfiable requests)
+- DELETE request sent by a user or another k8s component
+
+Note that, the point about the Pod being terminating is important here. As
+long as the pod is not terminating it can be scheduled if resources are
+increased to satisfy its requests.
+
+3. <b id="3rd_scenario">Pending, terminating, and scheduled</b> (planned for second Beta)
+
+This pod state is characterized by the following:
+- the Pod's `.spec.nodeName` is set, but the node no longer exists
+- `Pending` phase
+- the Pod's `deletionTimestamp` is set by a DELETE request (terminating)
+
+Example steps leading to the Pod's state:
+- Pod scheduled to a node, but remains in `Pending` (e.g. due to an invalid
+image reference, invalid config map, one of the containers failing to start)
+- DELETE request sent by a user or another k8s component
+
+Note that, the point about the Pod being terminating is important here. As long
+as the pod is not terminating, it could be a transient issue and Kubelet can
+make progress after retrying.
+
+##### Review of example steps for the 3rd scenario
+
+Below we present example steps leading to the [3rd scenario](#3rd_scenario) on k8s 1.26.
+
+**Invalid image reference, pod deleted by a user**
+
+1. create a pod with invalid image reference, example `yaml`:
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: invalid-image
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: invalid-image
+        image: non_existing_image_name:102
+        command: ["bash"]
+        args: ["-c", 'echo "Hello world"']
+  podFailurePolicy: # this is just to prevent considering the pod as failed until in terminal phase
+    rules: []
+  backoffLimit: 0
+```
+2. delete the pod with `kubectl delete pods -l job-name=invalid-image`
+
+The relevant fields of the pod:
+
+```
+  metadata:
+    deletionTimestamp: "2023-02-03T13:48:14Z"
+    finalizers:
+    - batch.kubernetes.io/job-tracking
+  status:
+    conditions:
+    - status: "True"
+      type: Initialized
+    - status: "False"
+      type: Ready
+    - status: "False"
+      type: ContainersReady
+    - status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - image: non_existing_image_name:102
+      state:
+        waiting:
+          message: Back-off pulling image "non_existing_image_name:102"
+          reason: ImagePullBackOff
+    phase: Pending
+```
+
+The pod is stuck in the Pending and Terminating state. The finalizer
+is not deleted by Job controller as it requires the pod to be in terminal
+phase when `podFailurePolicy` is defined. The pod remains in the state even
+if the image reference is fixed manually.
+
+**Invalid image reference, pod deleted by scheduler**
+
+1. Create a pod similar to the one above, but extend it with requests to
+ensure it will be preempted by another pod with a higher priority
+2. Create another pod with the critical priority (e.g. `system-node-critical`)
+on the same node so that Kube-scheduler preempts the first pod.
+
+The status looks like in the previous example, but contains the
+`DisruptionTarget=True` condition.
+
+As above, the pod is stuck in the Pending and Terminating state.
+
+**Invalid configMap reference, pod deleted by a user**
+
+1. create a pod with invalid configMap reference, example `yaml`:
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: invalid-configmap-ref
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+      - name: volume-name
+        configMap:
+          name: invalid-config-name-name
+      containers:
+      - name: invalid-configmap-ref
+        image: centos:7
+        command: ["bash"]
+        args: ["-c", 'echo "Hello world"']
+        volumeMounts:
+        - mountPath: /script_path
+          name: volume-name
+  podFailurePolicy:
+    rules: []
+  backoffLimit: 0
+```
+2. delete the pod with `kubectl delete pods -l job-name=invalid-configmap-ref`
+
+The relevant fields of the pod:
+
+```
+  metadata:
+    deletionTimestamp: "2023-02-03T13:48:14Z"
+    finalizers:
+    - batch.kubernetes.io/job-tracking
+  status:
+    conditions:
+    - status: "True"
+      type: Initialized
+    - status: "False"
+      type: Ready
+    - status: "False"
+      type: ContainersReady
+    - status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - image: centos:7
+      state:
+        terminated:
+          exitCode: 137
+          message: The container could not be located when the pod was terminated
+          reason: ContainerStatusUnknown
+    phase: Pending
+```
+
+As above, the pod is stuck in the Pending and Terminating state.
+
+**Correct config, but image takes long to download, pod deleted by a user in the meanwhile**
+
+This scenario is a little bit different, the config is correct, but the
+pod is deleted by a user while in the `Pending` phase. In that case, the
+pods transition into the `Running` phase and fail soon after. With the proposed
+change the transition will happen earlier, thus saving resources.
+
+1. create a pod using a huge image to be in the `Pending` phase for long, example `yaml`:
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: huge-image
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: huge-image
+        image: sagemathinc/cocalc # this is around 20GB
+        command: ["bash"]
+        args: ["-c", 'sleep 60 && echo "Hello world"']
+  podFailurePolicy:
+    rules: []
+  backoffLimit: 0
+```
+2. delete the pod with `kubectl delete pods -l job-name=huge-image`
+
+The relevant fields of the pod:
+
+```
+  status:
+    conditions:
+    - status: "True"
+      type: Initialized
+    - status: "False"
+      type: Ready
+    - reason: PodFailed
+      status: "False"
+      type: ContainersReady
+    - status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - image: docker.io/sagemathinc/cocalc:latest
+      state:
+        terminated:
+          exitCode: 137
+          reason: Error
+    phase: Failed
+```
+
+Here, the pod is not stuck, however it transitions to `Running` and fails
+soon after, making the interim transition to `Running` unnecessary. Also, there
+is a race condition, if the container succeeds before the graceful period for
+pod termination (if not for the `sleep 60` in the example above) the running pod may complete with the
+`Succeeded` status before its containers are killed (and it transitions in the
+`Failed` phase). This is already problematic for the Job controller, which might
+count the pod as failed, despite the pod eventually succeeding. With the proposed
+change, in the scenario, the pod transitions directly from the `Pending` phase
+to `Failed`.
+
+##### Proposed solution for the 3rd scenario
+
+We plan to fix the 3rd scenario by
+modifying Kubelet to transition such pods (`Pending`, terminating, and scheduled)
+into the `Failed` phase, allowing the Job
+controller to count them, match against the (optional) pod failure policy and
+remove their Job finalizers, allowing API server to complete deletion.
+
+In the final update transitioning the pod to the `Failed` phase Kubelet will
+also set the `reason` and the `message` field. We propose the values as
+`Deleted` and `Deleted while pending`, respectively, in order to reflect the
+direct reason for the pod to transitioned to the `Failed` phase.
+
+As the reasons for deleting a Pod while it is in the `Pending` phase might be
+various, it should be up to the controller or a user to add an adequate pod
+condition to reflect the reason. An example scenario when Kube-scheduler adds
+the `DisruptionTarget` is presented above.
+
+Note that, the transitioning such pods to Failed phase requires an additional
+PATCH request from Kubelet to the API server. However, the situation should be
+rare as it requires DELETE which needs to be send by a user or another component
+for the Pod to be terminating, so it should have a limited impact on performance.
+An analogous decision has been made for PodGC.
+
+A prototype implementation is prepared here:
+[Mark Pending Terminating pods as Failed by Kubelet](https://github.com/kubernetes/kubernetes/pull/115331).
+
+##### Implementation progress and plan
+
+For Alpha, we implemented a fix for scenarios 1. and 2. by setting the pod phase
+as `Failed` in PodGC. Note that, in both scenarios there is no Kubelet to
+transition the pod, thus it is done by PodGC.
+
+As the 3rd scenario wasn't fixed in the first iteration of Beta (1.26), we only
+require pods to be in terminal phase when `podFailurePolicy` is specified (and
+only in that case), but this creates an inconsistency with handling Jobs
+with and without pod failure policies
+(see Issue: [Job controller should wait for Pods to terminate to match the failure policy](https://github.com/kubernetes/kubernetes/issues/113855)).
+
+For the second iteration of Beta (1.27), we plan to fix the 3rd scenario as
+suggested above, see: [Proposed solution for the 3rd scenario](#proposed-solution-for-the-3rd-scenario).
+
+Also, for the second iteration of Beta (1.27) we are going to expand the
+feature documentation to explain this change. In particular, we are going to
+provide a list of example scenarios impacted by this change, including:
+invalid image reference, invalid config map reference.
+
+One release after the `PodDisruptionCondition` feature gate graduates to GA
+we plan to simplify Job controller to consider as failed (and count as such)
+pods which are in terminal phase regardless of the fact if the `podFailurePolicy`
+is specified (see [Deprecation](#deprecation)).
 
 ### Risks and Mitigations
 
@@ -1218,7 +1513,7 @@ the pod failure does not match any of the specified rules, then default
 handling of failed pods applies.
 
 If we limit this feature to use `onExitCodes` only when `restartPolicy=Never`
-(see: [limitting this feature](#limitting-this-feature)), then the rules using
+(see: [limiting this feature](#limitting-this-feature)), then the rules using
 `onExitCodes` are evaluated only against the exit codes in the `state` field
 (under `terminated.exitCode`) of `pod.status.containerStatuses` and
 `pod.status.initContainerStatuses`. We may also need to check for the exit codes
@@ -1279,9 +1574,9 @@ the following scenarios will be covered with unit tests:
 - handling of a pod failure, in accordance with the specified `spec.podFailurePolicy`,
   when the failure is associated with
   - a failed container with non-zero exit code,
-  - a dedicated Pod condition indicating termmination originated by a kubernetes component
+  - a dedicated Pod condition indicating termination originated by a kubernetes component
 - adding of the `DisruptionTarget` by Kubelet in case of:
-  - eviciton due to graceful node shutdown
+  - eviction due to graceful node shutdown
   - eviction due to node pressure
 <!--
 Additionally, for Alpha try to enumerate the core package you will be touching
@@ -1313,7 +1608,7 @@ The following scenarios will be covered with integration tests:
 - pod failure is caused by a failed container with a non-zero exit code
 
 More integration tests might be added to ensure good code coverage based on the
-actual implemention.
+actual implementation.
 
 <!--
 This question should be filled when targeting a release.
@@ -1338,8 +1633,22 @@ We expect no non-infra related flakes in the last month as a GA graduation crite
 - <test>: <link to test coverage
 
 -->
-The following scenario will be covered with e2e tests:
-- early job termination when a container fails with a non-retriable exit code
+The following scenario are covered with e2e tests:
+- [sig-apps#gce](https://testgrid.k8s.io/sig-apps#gce):
+  - Job Using a pod failure policy to not count some failures towards the backoffLimit Ignore DisruptionTarget condition
+  - Job Using a pod failure policy to not count some failures towards the backoffLimit Ignore exit code 137
+  - Job should allow to use the pod failure policy on exit code to fail the job early
+  - Job should allow to use the pod failure policy to not count the failure towards the backoffLimit
+- [sig-scheduling#gce-serial](https://testgrid.k8s.io/sig-scheduling#gce-serial):
+  - SchedulerPreemption [Serial] validates pod disruption condition is added to the preempted pod
+- [sig-release-master-informing#gce-cos-master-serial](https://testgrid.k8s.io/sig-release-master-informing#gce-cos-master-serial):
+  - NoExecuteTaintManager Single Pod [Serial] pods evicted from tainted nodes have pod disruption condition
+
+The following scenarios are covered with node e2e tests
+([sig-node-presubmits#pr-kubelet-gce-e2e-pod-disruption-conditions](https://testgrid.k8s.io/sig-node-presubmits#pr-kubelet-gce-e2e-pod-disruption-conditions) and
+[sig-node-presubmits#pr-node-kubelet-serial-containerd](https://testgrid.k8s.io/sig-node-presubmits#pr-node-kubelet-serial-containerd)):
+  - GracefulNodeShutdown [Serial] [NodeFeature:GracefulNodeShutdown] [NodeFeature:GracefulNodeShutdownBasedOnPodPriority] graceful node shutdown when PodDisruptionConditions are enabled [NodeFeature:PodDisruptionConditions] should add the DisruptionTarget pod failure condition to the evicted pods
+  - PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction] when we run containers that should cause PIDPressure; PodDisruptionConditions enabled [NodeFeature:PodDisruptionConditions] should eventually evict all of the correct pods
 
 More e2e test scenarios might be considered during implementation if practical.
 
@@ -1399,22 +1708,18 @@ Below are some examples to consider, in addition to the aforementioned [maturity
   [SSA](https://kubernetes.io/docs/reference/using-api/server-side-apply/) client.
 - The feature flag enabled by default
 
+Second iteration:
+ - Extend Kubelet to mark as failed pending terminating pods (see: [Marking pods as Failed](#marking-pods-as-failed)).
+ - Extend the feature documentation to explain transitioning of pending and
+   terminating pods into `Failed` phase.
+
 #### GA
 
 - Address reviews and bug reports from Beta users
-- The feature is unconditionally enabled
-- Simplify the code in job controller responsible for detection of failed pods
-  based on the fix for pods stuck in the running phase (see: [Marking pods as Failed](marking-pods-as-failed)).
-  Also, extend PodGC to mark as failed (and delete) terminating pods
-  (with set deletionTimestamp) which stuck in the pending.
-- Discuss within the community (involving CNCF Technical Advisory Group for
-  Runtime, SIG-node, container runtime implementations) the standarization of
-  the CRI API to communicate an OOM kill occurrence by contatiner runtime to
-  Kubelet. In particular, suggest that the API should allow to convey the reason
-  for OOM killer being invoked (to distinguish if the container was killed due
-  to exceeding its limits or due to system running low on memory).
-- Review of the implementation of hanling OOM kill events by Kubelet depending
-  on the outcome of the discussions and the standardized API.
+- Write a blog post about the feature
+- Graduate e2e tests as conformance tests
+- Lock the `PodDisruptionConditions` and `JobPodFailurePolicy` feature-gates
+- Declare deprecation of the `PodDisruptionConditions` and `JobPodFailurePolicy` feature-gates in documentation
 
 <!--
 **Note:** Generally we also wait at least two releases between beta and
@@ -1430,7 +1735,14 @@ in back-to-back releases.
 
 #### Deprecation
 
-N/A
+In GA+1 release:
+- Modify the code to ignore the `PodDisruptionConditions` and `JobPodFailurePolicy` feature gates
+- Simplify the Job controller to wait for pods to terminate before counting them
+  as failed or matching against the pod failure policy, regardless if the pod
+  failure policy is specified (see: [Job controller should wait for Pods to terminate to match the failure policy](https://github.com/kubernetes/kubernetes/issues/113855)).
+
+In GA+2 release:
+- Remove the `PodDisruptionConditions` and `JobPodFailurePolicy` feature gates
 
 ### Upgrade / Downgrade Strategy
 
@@ -1439,7 +1751,7 @@ N/A
 An upgrade to a version which supports this feature should not require any
 additional configuration changes. In order to use this feature after an upgrade
 users will need to configure their Jobs by specifying `spec.podFailurePolicy`. The
-only noticeable difference in behaviour, without specifying `spec.podFailurePolicy`,
+only noticeable difference in behavior, without specifying `spec.podFailurePolicy`,
 is that Pods terminated by kubernetes components will have an additional
 condition appended to `status.conditions`.
 
@@ -1543,7 +1855,7 @@ well as the [existing list] of feature gates.
   - Will enabling / disabling the feature require downtime of the control
     plane?
   - Will enabling / disabling the feature require downtime or reprovisioning
-    of a node? (Do not assume `Dynamic Kubelet Config` feature is enabled).
+    of a node?
 
 ###### Does enabling the feature change any default behavior?
 
@@ -1654,7 +1966,7 @@ Manual test performed to simulate the upgrade->downgrade->upgrade scenario:
   - Scenario 2:
     - Create a job with a long running containers and `backoffLimit=0`.
     - Verify that the job continues after the node in uncordoned
-1. Disable the feature gates. Verify that the above scenarios result in default behaviour:
+1. Disable the feature gates. Verify that the above scenarios result in default behavior:
   - In scenario 1: the job restarts pods failed with exit code `42`
   - In scenario 2: the job is failed due to exceeding the `backoffLimit` as the failed pod failed during the draining
 1. Re-enable the feature gates
@@ -1801,7 +2113,10 @@ previous answers based on experience in the field.
 
 ###### Will enabling / using this feature result in any new API calls?
 
-Yes. An API call to append a Pod condition when deleting the Pod.
+Yes. A PATCH API call to append a Pod condition when deleting the Pod. Also,
+one PATCH API call to set Pod's phase as `Failed` in scenarios (2nd and 3rd)
+described under [Marking pods as Failed](#marking-pods-as-failed). Note that,
+in the 1st scenario the phase is set along with adding the Pod condition.
 
 <!--
 Describe them, providing:
@@ -1897,6 +2212,19 @@ This through this both in small and large cases, again with respect to the
 [supported limits]: https://git.k8s.io/community//sig-scalability/configs-and-limits/thresholds.md
 -->
 
+###### Can enabling / using this feature result in resource exhaustion of some node resources (PIDs, sockets, inodes, etc.)?
+
+No. This feature does not introduce any resource exhaustive operations.
+
+<!--
+Focus not just on happy cases, but primarily on more pathological cases
+(e.g. probes taking a minute instead of milliseconds, failed pods consuming resources, etc.).
+If any of the resources can be exhausted, how this is mitigated with the existing limits
+(e.g. pods per node) or new limits added by this KEP?
+Are there any tests that were run/should be run to understand performance characteristics better
+and validate the declared limits?
+-->
+
 ### Troubleshooting
 
 <!--
@@ -1953,7 +2281,7 @@ technics apply):
   is an increase of the Job controller processing time.
 - Inspect the Job controller's `job_pods_finished_total` metric for the
   to check if the numbers of pod failures handled by specific actions (counted
-  by the `failure_policy_action` label) agree with the expetations.
+  by the `failure_policy_action` label) agree with the expectations.
   For example, if a user configures job failure policy with `Ignore` action for
   the `DisruptionTarget` condition, then a node drain is expected to increase
   the metric for `failure_policy_action=Ignore`.
@@ -1963,7 +2291,7 @@ technics apply):
 
 - 2022-06-23: Initial KEP merged
 - 2022-07-12: Preparatory PR "Refactor gc_controller to do not use the deletePod stub" merged
-- 2022-07-14: Preparatory PR "efactor taint_manager to do not use getPod and getNode stubs" merged
+- 2022-07-14: Preparatory PR "Refactor taint_manager to do not use getPod and getNode stubs" merged
 - 2022-07-20: Preparatory PR "Add integration test for podgc" merged
 - 2022-07-28: KEP updates merged
 - 2022-08-01: Additional KEP updates merged
@@ -1972,7 +2300,7 @@ technics apply):
 - 2022-08-04: PR "Support handling of pod failures with respect to the configured rules" merged
 - 2022-09-09: Bugfix PR for test "Fix the TestRoundTripTypes by adding default to the fuzzer" merged
 - 2022-09-26: Prepared PR for KEP Beta update. Summary of the changes:
-  - propsal to extend kubelet to add the following pod conditions when evicting a pod (see [Design details](#design-details)):
+  - proposal to extend kubelet to add the following pod conditions when evicting a pod (see [Design details](#design-details)):
     - DisruptionTarget for evictions due graceful node shutdown, admission errors, node pressure or Pod admission errors
     - ResourceExhausted for evictions due to OOM killer and exceeding Pod's ephemeral-storage limits
   - extended the review of pod eviction scenarios by kubelet-initiated pod evictions:
@@ -1990,6 +2318,15 @@ technics apply):
 - 2022-10-27: PR "Use SSA to add pod failure conditions" ([link](https://github.com/kubernetes/kubernetes/pull/113304))
 - 2022-10-31: PR "Extend metrics with the new labels" ([link](https://github.com/kubernetes/kubernetes/pull/113324))
 - 2022-11-03: PR "Fix disruption controller permissions to allow patching pod's status" ([link](https://github.com/kubernetes/kubernetes/pull/113580))
+- 2022-11-08: KEP update for Beta ([link](https://github.com/kubernetes/enhancements/pull/3646)) with main changes:
+  - do not introduce the `ResourceExhausted` condition (it was planned to be used for pods killed due to OOM killer or exceeding ephemeral storage limits)
+  - do not add `DisruptionTarget` condition in case of admission failures
+- 2022-11-11: PR "Fix match onExitCodes when Pod is not terminated" ([link](https://github.com/kubernetes/kubernetes/pull/113856))
+- 2022-11-11: PR "Wait for Pods to finish before considering Failed in Job" ([link](https://github.com/kubernetes/kubernetes/pull/113860))
+- 2022-11-15: PR "Add e2e test to ignore failures with 137 exit code" ([link](https://github.com/kubernetes/kubernetes/pull/113927))
+- 2023-01-03: PR "Fix clearing of rate-limiter for the queue of checks for cleaning stale pod disruption conditions" ([link](https://github.com/kubernetes/kubernetes/pull/114770))
+- 2023-01-09: PR "Adjust DisruptionTarget condition message to do not include preemptor pod metadata" ([link](https://github.com/kubernetes/kubernetes/pull/114914))
+- 2023-01-13: PR "PodGC should not add DisruptionTarget condition for pods which are in terminal phase" ([link](https://github.com/kubernetes/kubernetes/pull/115056))
 
 <!--
 Major milestones in the lifecycle of a KEP should be tracked in this section.
